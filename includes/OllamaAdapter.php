@@ -179,6 +179,16 @@ class OllamaAdapter implements AIClientInterface {
    * {@inheritdoc}
    */
   public function chat(string $model, array $messages, $temperature, $max_tokens = 1024, bool $stream_response = FALSE) {
+    // Allow other modules to alter chat messages before sending (e.g., inject site context).
+    if (function_exists('backdrop_alter')) {
+      $context = [
+        'operation' => 'chat',
+        'model' => $model,
+        'provider' => 'ollama',
+      ];
+      backdrop_alter('openai_chat_messages', $messages, $context);
+    }
+
     $params = [
       'model' => $model,
       'messages' => $messages,
@@ -240,6 +250,7 @@ class OllamaAdapter implements AIClientInterface {
       ]);
 
       $result = $response->embeddings[0]->embedding ?? [];
+
       // Prepare lightweight metadata for logging instead of the full
       // embeddings payload, which can be very large.
       $embedding_count = 0;
@@ -258,13 +269,13 @@ class OllamaAdapter implements AIClientInterface {
       ];
       // Prepare sanitized input metadata for logging; avoid logging full input
       // content to reduce the risk of persisting sensitive user data.
-      $input_preview = mb_substr($input, 0, 200);
+      $input_preview = (function_exists('mb_substr') ? mb_substr($input, 0, 200) : substr($input, 0, 200));
       $input_log_data = [
         'input_length' => $response_metadata['input_length'],
         'input_preview' => $input_preview,
-        'input_preview_truncated' => (mb_strlen($input) > mb_strlen($input_preview)),
+        'input_preview_truncated' => ((function_exists('mb_strlen') ? mb_strlen($input) : strlen($input)) > (function_exists('mb_strlen') ? mb_strlen($input_preview) : strlen($input_preview))),
       ];
-      // Note: `method_exists()` accepts an object or a class-name string. If
+      // `method_exists()` accepts an object or a class-name string. If
       // `$this->api` ever holds a class-name string, calling
       // `$this->api->recordLog(...)` will fatal. Require an object here to
       // ensure instance method invocation is safe.
@@ -276,37 +287,14 @@ class OllamaAdapter implements AIClientInterface {
     }
     catch (\Exception $e) {
       // Also log to the central openai_log if possible.
-      // The special-case suppression for "does not support embeddings"
-      // currently only affected the watchdog() call. RecordLog() was being
-      // invoked before that suppression check, which meant probe errors were
-      // still written to the central log when `$log` was TRUE. Apply the same
-      // suppression here and require an object for safe method invocation.
-      $error_msg = $e->getMessage();
-      $is_probe_no_embeddings = (strpos($error_msg, 'does not support embeddings') !== FALSE);
-      if (!$is_probe_no_embeddings) {
-        if (is_object($this->api) && method_exists($this->api, 'recordLog')) {
-          $duration = microtime(TRUE) - $start_time;
-          // SECURITY: Logging the raw `input` here can persist end-user content
-          // (including PII or secrets) to logs. By default we truncate the
-          // logged input to avoid accidental leakage. If you need full input
-          // logging, add an explicit opt-in (e.g., `log_full_inputs`) behind
-          // protected configuration and audit access to those logs.
-          $logged_input = $input;
-          if (is_string($input)) {
-            $max_log_chars = 200;
-            if (function_exists('mb_substr')) {
-              $logged_input = mb_strlen($input) > $max_log_chars ? mb_substr($input, 0, $max_log_chars) . '... (truncated)' : $input;
-            } else {
-              $logged_input = strlen($input) > $max_log_chars ? substr($input, 0, $max_log_chars) . '... (truncated)' : $input;
-            }
-          }
-          $this->api->recordLog('embedding', $model, ['input' => $logged_input], NULL, FALSE, $duration, $error_msg, !$log);
-        }
+      if (isset($this->api) && method_exists($this->api, 'recordLog')) {
+        $duration = microtime(TRUE) - ($start_time ?? microtime(TRUE));
+        $this->api->recordLog('embedding', $model, ['input' => $input], NULL, FALSE, $duration, $e->getMessage(), !$log);
       }
       if ($log) {
-        // Specifically suppress watchdog logging for the probing "does not
-        // support embeddings" message so probes don't create noise.
-        if (!$is_probe_no_embeddings) {
+        $error_msg = $e->getMessage();
+        // Specifically suppress log if it's a "does not support embeddings" error during probing.
+        if (strpos($error_msg, 'does not support embeddings') === FALSE) {
           watchdog('openai_ollama', 'Embedding failed: @error', ['@error' => $error_msg], WATCHDOG_ERROR);
         }
       }
